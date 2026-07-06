@@ -1,0 +1,25 @@
+# 二进制
+/bin/
+/deepseek-api
+*.exe
+
+# 依赖
+/vendor/
+
+# 环境
+.env
+
+# 登录态资产
+/data/storage_states/*.json
+
+# 前端
+/web/dist
+/web/node_modules
+
+# IDE
+.idea/
+.vscode/
+
+# 日志
+*.log
+/logs/

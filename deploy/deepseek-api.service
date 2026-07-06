@@ -1,0 +1,21 @@
+[Unit]
+Description=DeepSeek Web API (Go)
+After=network.target mysql.service redis.service
+
+[Service]
+Type=simple
+User=deepseek
+Group=deepseek
+WorkingDirectory=/opt/deepseek-api
+EnvironmentFile=/opt/deepseek-api/.env
+ExecStart=/opt/deepseek-api/deepseek-api
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# 优雅退出：等待进行中的流式请求完成
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
