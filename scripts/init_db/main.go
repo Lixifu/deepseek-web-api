@@ -34,7 +34,8 @@ func main() {
 	}
 	if err := db.AutoMigrate(
 		&model.Account{}, &model.APIKey{}, &model.Conversation{},
-		&model.UsageHourly{}, &model.Admin{},
+		&model.UsageHourly{}, &model.Admin{}, &model.AuditLog{},
+		&model.AuditLogArchive{},
 	); err != nil {
 		logger.Fatal("auto migrate", zap.Error(err))
 	}
@@ -48,6 +49,9 @@ func main() {
 		if err := repo.CreateAdmin(context.Background(), &model.Admin{
 			Username:     cfg.AdminUser,
 			PasswordHash: string(hash),
+			Role:         "superadmin",
+			Enabled:      true,
+			TokenVersion: 1,
 		}); err != nil {
 			logger.Fatal("create admin", zap.Error(err))
 		}

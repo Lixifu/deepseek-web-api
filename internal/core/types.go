@@ -72,7 +72,7 @@ type ToolCall struct {
 type Message struct {
 	Role       string     `json:"role" binding:"required"`
 	Content    Content    `json:"content"`
-	Name       string     `json:"name,omitempty"`        // tool 角色用：工具名
+	Name       string     `json:"name,omitempty"`         // tool 角色用：工具名
 	ToolCallID string     `json:"tool_call_id,omitempty"` // tool 角色用：对应 tool_call.id
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 角色用：本回合发起的调用
 }
@@ -94,13 +94,13 @@ type Tool struct {
 
 // ChatRequest 一次对话请求
 type ChatRequest struct {
-	Messages     []Message
-	Model        string
-	Stream       bool
-	APIKeyID     uint
-	QuotaPerDay  int  // 该 API key 的日配额（0 表示不限），由中间件传入
-	Tools        []Tool  // 工具定义
-	ToolChoice   any     // "auto" / "none" / {"type":"function","function":{"name":"xxx"}}
+	Messages    []Message
+	Model       string
+	Stream      bool
+	APIKeyID    uint
+	QuotaPerDay int    // 该 API key 的日配额（0 表示不限），由中间件传入
+	Tools       []Tool // 工具定义
+	ToolChoice  any    // "auto" / "none" / {"type":"function","function":{"name":"xxx"}}
 }
 
 // BuildPrompt 把 messages 数组拼成单条 prompt。
@@ -160,11 +160,16 @@ func BuildPrompt(messages []Message) string {
 
 // 错误定义
 var (
-	ErrNoSession           = errors.New("no available browser session")
-	ErrAllSessionsDown     = errors.New("all sessions unavailable")
-	ErrSessionExpired      = errors.New("session expired")
-	ErrDeepSeekBlocked     = errors.New("deepseek blocked the request")
-	ErrSelectorNotFound    = errors.New("selector not found on page")
+	ErrNoSession              = errors.New("no available browser session")
+	ErrPoolBusy               = errors.New("all browser sessions are busy")
+	ErrQueueFull              = errors.New("browser request queue is full")
+	ErrQueueTimeout           = errors.New("timed out waiting for a browser session")
+	ErrSharedQueueUnavailable = errors.New("redis shared queue unavailable")
+	ErrPoolCapacity           = errors.New("browser pool capacity reached")
+	ErrAllSessionsDown        = errors.New("all sessions unavailable")
+	ErrSessionExpired         = errors.New("session expired")
+	ErrDeepSeekBlocked        = errors.New("deepseek blocked the request")
+	ErrSelectorNotFound       = errors.New("selector not found on page")
 )
 
 // IsSessionExpired 判断是否登录态失效

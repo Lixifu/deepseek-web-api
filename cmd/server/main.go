@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,8 +24,10 @@ import (
 	v1 "deepseek-web-api/internal/api/v1"
 	"deepseek-web-api/internal/config"
 	"deepseek-web-api/internal/core"
+	"deepseek-web-api/internal/maintenance"
 	"deepseek-web-api/internal/middleware"
 	"deepseek-web-api/internal/model"
+	"deepseek-web-api/internal/observability"
 	"deepseek-web-api/internal/repository"
 )
 
@@ -73,7 +76,7 @@ func main() {
 	// 自动建表（生产建议用 SQL 脚本）
 	if err := db.AutoMigrate(
 		&model.Account{}, &model.APIKey{}, &model.Conversation{},
-		&model.UsageHourly{}, &model.Admin{},
+		&model.UsageHourly{}, &model.Admin{}, &model.AuditLog{}, &model.AuditLogArchive{},
 	); err != nil {
 		logger.Fatal("auto migrate", zap.Error(err))
 	}
@@ -86,9 +89,14 @@ func main() {
 	}
 
 	// Redis
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, DB: cfg.RedisDB})
+	var rdb *redis.Client
+	rdb = redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, DB: cfg.RedisDB})
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		logger.Warn("redis ping failed, rate limiter disabled", zap.Error(err))
+		_ = rdb.Close()
+		rdb = nil
+	} else {
+		defer rdb.Close()
 	}
 
 	// 加载账号
@@ -104,17 +112,44 @@ func main() {
 		accConfigs = append(accConfigs, core.AccountConfig{
 			ID: a.ID, Name: a.Name, StoragePath: a.StoragePath,
 		})
+		if cfg.PoolSize > 0 && len(accConfigs) >= cfg.PoolSize {
+			break
+		}
 	}
 
 	// 浏览器池
 	pool := core.NewBrowserPool(cfg.Headless, logger)
-	if len(accConfigs) > 0 {
-		if err := pool.Start(accConfigs); err != nil {
-			logger.Fatal("start browser pool", zap.Error(err))
+	pool.Configure(cfg.PoolSize, cfg.QueueMaxSize, time.Duration(cfg.QueueTimeout)*time.Second)
+	if cfg.RedisSharedQueue {
+		if rdb == nil {
+			logger.Fatal("redis shared queue is enabled but redis is unavailable")
 		}
-		defer pool.Stop()
-	} else {
-		logger.Warn("no active accounts configured, browser pool not started")
+		clusterCapacity := cfg.ClusterConcurrency
+		if clusterCapacity == 0 {
+			clusterCapacity = cfg.PoolSize
+		}
+		sharedQueue, err := core.NewRedisSharedQueue(rdb, core.RedisSharedQueueConfig{
+			KeyPrefix:    cfg.RedisQueuePrefix,
+			Capacity:     clusterCapacity,
+			MaxQueue:     cfg.QueueMaxSize,
+			WaitTimeout:  time.Duration(cfg.QueueTimeout) * time.Second,
+			LeaseTTL:     time.Duration(cfg.QueueLeaseTTL) * time.Second,
+			PollInterval: time.Duration(cfg.QueuePollMS) * time.Millisecond,
+		}, logger)
+		if err != nil {
+			logger.Fatal("configure redis shared queue", zap.Error(err))
+		}
+		pool.SetSharedQueue(sharedQueue)
+		logger.Info("redis shared browser queue enabled",
+			zap.Int("cluster_capacity", clusterCapacity),
+			zap.Int("max_waiting", cfg.QueueMaxSize))
+	}
+	if err := pool.Start(accConfigs); err != nil {
+		logger.Fatal("start browser pool", zap.Error(err))
+	}
+	defer pool.Stop()
+	if len(accConfigs) == 0 {
+		logger.Warn("no active accounts configured; browser is ready for hot loading")
 	}
 
 	// 限流器
@@ -133,15 +168,88 @@ func main() {
 
 	// Gin
 	r := gin.New()
-	r.Use(middleware.Recovery(logger), middleware.Logger(logger), cors.Default())
+	if err := r.SetTrustedProxies([]string{"127.0.0.1", "::1"}); err != nil {
+		logger.Fatal("configure trusted proxies", zap.Error(err))
+	}
+	r.Use(middleware.Recovery(logger), middleware.Logger(logger))
+	if cfg.CORSOrigins != "" {
+		origins := strings.Split(cfg.CORSOrigins, ",")
+		for i := range origins {
+			origins[i] = strings.TrimSpace(origins[i])
+		}
+		r.Use(cors.New(cors.Config{
+			AllowOrigins: origins,
+			AllowMethods: []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
+			AllowHeaders: []string{"Authorization", "Content-Type", "X-Admin-Token"},
+			MaxAge:       12 * time.Hour,
+		}))
+	}
 
 	// 健康检查
 	r.GET("/healthz", func(c *gin.Context) {
+		queueCtx, cancel := context.WithTimeout(c.Request.Context(), time.Second)
+		defer cancel()
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "ok",
 			"available": pool.Available(),
+			"queued":    pool.EffectiveQueueLength(queueCtx),
 		})
 	})
+	r.GET("/metrics", gin.WrapH(observability.Handler()))
+
+	metricsStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			total, healthy, busy := pool.SessionStats()
+			queueCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			queued := pool.EffectiveQueueLength(queueCtx)
+			cancel()
+			observability.UpdatePool(total, healthy, busy, queued)
+			observability.UpdateBrowserMemory(observability.ChromiumMemoryBytes())
+			select {
+			case <-ticker.C:
+			case <-metricsStop:
+				return
+			}
+		}
+	}()
+
+	auditArchiver := maintenance.NewAuditArchiver(repo, rdb, maintenance.AuditArchiverConfig{
+		ArchiveAfterDays: cfg.AuditArchiveDays,
+		RetentionDays:    cfg.AuditArchiveRetention,
+		BatchSize:        cfg.AuditArchiveBatch,
+		LockKeyPrefix:    cfg.RedisQueuePrefix,
+	})
+	auditArchiveStop := make(chan struct{})
+	go func() {
+		run := func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			result, err := auditArchiver.RunOnce(ctx)
+			if err != nil {
+				logger.Warn("scheduled audit archive failed", zap.Error(err))
+				return
+			}
+			if !result.Skipped && (result.Archived > 0 || result.Deleted > 0) {
+				logger.Info("scheduled audit archive completed",
+					zap.Int64("archived", result.Archived),
+					zap.Int64("deleted", result.Deleted))
+			}
+		}
+		run()
+		ticker := time.NewTicker(time.Duration(cfg.AuditArchiveInterval) * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				run()
+			case <-auditArchiveStop:
+				return
+			}
+		}
+	}()
 
 	// v1 API（OpenAI 兼容）
 	v1g := r.Group("/v1", middleware.APIKeyAuth(repo, logger))
@@ -149,21 +257,29 @@ func main() {
 
 	// 管理后台
 	adminH := &admin.Handler{
-		Repo:       repo,
-		Pool:       pool,
-		JWTSecret:  cfg.JWTSecret,
-		StorageDir: cfg.StorageDir,
-		Selectors:  core.DefaultSelectors,
-		Logger:     logger,
+		Repo:               repo,
+		Pool:               pool,
+		JWTSecret:          cfg.JWTSecret,
+		StorageDir:         cfg.StorageDir,
+		Selectors:          core.DefaultSelectors,
+		Logger:             logger,
+		AuditArchiver:      auditArchiver,
+		AuditExportMaxRows: cfg.AuditExportMaxRows,
+	}
+	if rdb != nil {
+		adminH.LoginLimiter = core.NewRateLimiter(rdb, cfg.AdminLoginRate)
 	}
 	admin.Register(r.Group("/admin"), adminH)
 
 	// 启动 HTTP
 	srv := &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", cfg.AppHost, cfg.AppPort),
-		Handler:      r,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 600 * time.Second, // SSE 长连接
+		Addr:              fmt.Sprintf("%s:%d", cfg.AppHost, cfg.AppPort),
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      600 * time.Second, // SSE 长连接
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	go func() {
 		logger.Info("server starting", zap.String("addr", srv.Addr))
@@ -182,13 +298,31 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Error("forced shutdown", zap.Error(err))
 	}
+	close(metricsStop)
+	close(auditArchiveStop)
 	logger.Info("server stopped")
 }
 
 // seedAdmin 如果不存在管理员，用配置的默认账号创建一个
 func seedAdmin(repo *repository.Repository, cfg *config.Config) error {
-	if _, err := repo.GetAdminByUsername(context.Background(), cfg.AdminUser); err == nil {
-		return nil // 已存在
+	if existing, err := repo.GetAdminByUsername(context.Background(), cfg.AdminUser); err == nil {
+		changed := false
+		if existing.Role == "" {
+			existing.Role = "superadmin"
+			changed = true
+		}
+		if existing.TokenVersion == 0 {
+			existing.TokenVersion = 1
+			changed = true
+		}
+		if !existing.Enabled {
+			// 不自动重新启用已被明确禁用的管理员。
+			return nil
+		}
+		if changed {
+			return repo.UpdateAdmin(context.Background(), existing)
+		}
+		return nil
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(cfg.AdminPass), bcrypt.DefaultCost)
 	if err != nil {
@@ -197,6 +331,9 @@ func seedAdmin(repo *repository.Repository, cfg *config.Config) error {
 	return repo.CreateAdmin(context.Background(), &model.Admin{
 		Username:     cfg.AdminUser,
 		PasswordHash: string(hash),
+		Role:         "superadmin",
+		Enabled:      true,
+		TokenVersion: 1,
 	})
 }
 

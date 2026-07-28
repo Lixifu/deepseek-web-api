@@ -9,16 +9,20 @@ import (
 
 // AdminClaims 管理后台 JWT 声明
 type AdminClaims struct {
-	AdminID  uint   `json:"admin_id"`
-	Username string `json:"username"`
+	AdminID      uint   `json:"admin_id"`
+	Username     string `json:"username"`
+	Role         string `json:"role"`
+	TokenVersion uint   `json:"token_version"`
 	jwt.RegisteredClaims
 }
 
 // SignJWT 签发管理后台 token，有效期 24h
-func SignJWT(secret string, adminID uint, username string) (string, error) {
+func SignJWT(secret string, adminID uint, username, role string, tokenVersion uint) (string, error) {
 	claims := AdminClaims{
-		AdminID:  adminID,
-		Username: username,
+		AdminID:      adminID,
+		Username:     username,
+		Role:         role,
+		TokenVersion: tokenVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

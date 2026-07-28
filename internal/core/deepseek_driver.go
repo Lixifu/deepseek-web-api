@@ -197,11 +197,20 @@ func (d *DeepSeekDriver) streamReply(ctx context.Context, page playwright.Page, 
 	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 
-	// 用 JS 同时检测：停止按钮是否存在 + 思维链/正文文本
+	// 用 JS 同时检测：停止按钮是否存在 + 本次新增的最后一条助手消息。
+	// 不能扫描页面上所有 markdown，否则第二轮开始会把历史回复重复返回。
 	// 停止按钮存在 = 正在生成；消失 = 生成完成
-	jsPoll := `() => {
-	  const sel = '.ds-markdown--block, .ds-markdown, .markdown-body';
-	  const blocks = document.querySelectorAll(sel);
+	jsPoll := fmt.Sprintf(`() => {
+	  const assistantSelector = %q;
+	  const assistantNodes = document.querySelectorAll(assistantSelector);
+	  const current = assistantNodes.length > %d
+	    ? assistantNodes[assistantNodes.length - 1]
+	    : null;
+	  const blocks = !current
+	    ? []
+	    : (current.matches('.ds-markdown--block, .ds-markdown, .markdown-body')
+	        ? [current]
+	        : current.querySelectorAll('.ds-markdown--block, .ds-markdown, .markdown-body'));
 	  let reasoning = '', content = '';
 	  for (const block of blocks) {
 	    const text = block.innerText || '';
@@ -217,7 +226,7 @@ func (d *DeepSeekDriver) streamReply(ctx context.Context, page playwright.Page, 
 	    if (t === '停止') { stopBtn = true; break; }
 	  }
 	  return {reasoning, content, stopBtn};
-	}`
+	}`, d.sel.AssistantMsg, beforeCount)
 
 	startTime := time.Now()
 	maxWait := 600 // 最多 180s（600 ticks * 300ms）

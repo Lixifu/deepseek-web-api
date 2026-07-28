@@ -44,6 +44,10 @@ func ParseModelName(model string) ModelConfig {
 	lower := strings.ToLower(strings.TrimSpace(model))
 
 	switch {
+	case lower == "deepseek-reasoner":
+		mc.Mode = "default"
+		mc.Thinking = true
+		return mc
 	case strings.HasPrefix(lower, "deepseek-expert"):
 		mc.Mode = "expert"
 	case strings.HasPrefix(lower, "deepseek-vision"):
@@ -74,6 +78,7 @@ func SupportedModels() []string {
 	// vision 不支持 think/search
 	return []string{
 		"deepseek-chat",
+		"deepseek-reasoner",
 		"deepseek-chat-think",
 		"deepseek-chat-search",
 		"deepseek-chat-think-search",
@@ -83,6 +88,16 @@ func SupportedModels() []string {
 		"deepseek-expert-think-search",
 		"deepseek-vision",
 	}
+}
+
+// IsSupportedModel 检查请求模型是否在公开支持列表中。
+func IsSupportedModel(model string) bool {
+	for _, supported := range SupportedModels() {
+		if model == supported {
+			return true
+		}
+	}
+	return false
 }
 
 // ApplyMode 在 DeepSeek 页面上切换模式与开关
