@@ -1,0 +1,4 @@
+[mysqld]
+# The application and maintenance commands connect locally on this host.
+# Do not expose the database directly to the public network.
+bind-address=127.0.0.1

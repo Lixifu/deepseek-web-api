@@ -7,16 +7,24 @@ import (
 	"strings"
 	"time"
 
+	"deepseek-web-api/internal/auth"
+	"deepseek-web-api/internal/model"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
-	"deepseek-web-api/internal/auth"
-	"deepseek-web-api/internal/model"
 )
 
 // APIKeyStore API Key 查询接口（由 repository 实现）
 type APIKeyStore interface {
 	FindAPIKeysByPrefix(ctx context.Context, prefix string) ([]model.APIKey, error)
+}
+
+type AdminStore interface {
+	GetAdmin(ctx context.Context, id uint) (*model.Admin, error)
+}
+
+type AuditStore interface {
+	CreateAuditLog(ctx context.Context, entry *model.AuditLog) error
 }
 
 // APIKeyAuth 校验 Authorization: Bearer <key>
@@ -48,11 +56,12 @@ func APIKeyAuth(store APIKeyStore, logger *zap.Logger) gin.HandlerFunc {
 					return
 				}
 				c.Set("api_key_id", k.ID)
-			c.Set("api_key_name", k.Name)
-			c.Set("api_key_default_model", k.DefaultModel)
-			c.Set("api_key_quota_per_day", k.QuotaPerDay)
-			c.Next()
-			return
+				c.Set("api_key_name", k.Name)
+				c.Set("api_key_default_model", k.DefaultModel)
+				c.Set("api_key_quota_per_day", k.QuotaPerDay)
+				c.Set("api_key_allowed_models", k.AllowedModels)
+				c.Next()
+				return
 			}
 		}
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid api key"})
@@ -91,7 +100,7 @@ func Recovery(logger *zap.Logger) gin.HandlerFunc {
 }
 
 // AdminAuth JWT 鉴权（管理后台）
-func AdminAuth(jwtSecret string, logger *zap.Logger) gin.HandlerFunc {
+func AdminAuth(jwtSecret string, store AdminStore, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := c.GetHeader("X-Admin-Token")
 		if token == "" {
@@ -109,8 +118,86 @@ func AdminAuth(jwtSecret string, logger *zap.Logger) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			return
 		}
-		c.Set("admin_id", claims.AdminID)
-		c.Set("admin_name", claims.Username)
+		admin, err := store.GetAdmin(c.Request.Context(), claims.AdminID)
+		if err != nil || !admin.Enabled || admin.TokenVersion != claims.TokenVersion {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "token revoked"})
+			return
+		}
+		c.Set("admin_id", admin.ID)
+		c.Set("admin_name", admin.Username)
+		c.Set("admin_role", admin.Role)
 		c.Next()
 	}
+}
+
+// RequireRoles 限制管理路由可访问的角色。
+func RequireRoles(roles ...string) gin.HandlerFunc {
+	allowed := make(map[string]struct{}, len(roles))
+	for _, role := range roles {
+		allowed[role] = struct{}{}
+	}
+	return func(c *gin.Context) {
+		role := c.GetString("admin_role")
+		if _, ok := allowed[role]; !ok {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// AuditAdminActions 记录所有改变状态的管理请求，不保存请求体或凭据。
+func AuditAdminActions(store AuditStore, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+		action := strings.ToLower(c.Request.Method)
+		switch c.Request.Method {
+		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
+		case http.MethodGet:
+			if !strings.HasSuffix(c.Request.URL.Path, "/audit-logs/export") {
+				return
+			}
+			action = "export"
+		default:
+			return
+		}
+		adminID := c.GetUint("admin_id")
+		if adminID == 0 {
+			return
+		}
+		resource, resourceID := auditResource(c.Request.URL.Path)
+		entry := &model.AuditLog{
+			AdminID:    adminID,
+			AdminName:  c.GetString("admin_name"),
+			Action:     action,
+			Resource:   resource,
+			ResourceID: resourceID,
+			Method:     c.Request.Method,
+			Path:       c.Request.URL.Path,
+			ClientIP:   c.ClientIP(),
+			Status:     c.Writer.Status(),
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := store.CreateAuditLog(ctx, entry); err != nil {
+			logger.Warn("write admin audit log", zap.Error(err))
+		}
+	}
+}
+
+func auditResource(path string) (string, string) {
+	trimmed := strings.Trim(strings.TrimPrefix(path, "/admin"), "/")
+	if trimmed == "" {
+		return "admin", ""
+	}
+	parts := strings.Split(trimmed, "/")
+	resource := parts[0]
+	resourceID := ""
+	if len(parts) > 1 {
+		resourceID = parts[1]
+	}
+	if resource == "change-password" {
+		return "admins", "self"
+	}
+	return resource, resourceID
 }

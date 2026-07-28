@@ -1,25 +1,52 @@
-# 二进制
+# 本地环境与密钥
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+/deploy/certs/
+
+# 运行时数据
+/data/storage_states/*
+!/data/storage_states/.gitkeep
+/data/uploads/
+/logs/
+*.log
+*.pid
+*.sqlite
+*.sqlite3
+
+# Go 构建与测试产物
 /bin/
 /deepseek-api
+/login_capture
 *.exe
-
-# 依赖
+*.test
+*.out
+/coverage/
+coverage.*
 /vendor/
 
-# 环境
-.env
+# 前端依赖与构建产物
+/web/node_modules/
+/web/dist/
+/web/.vite/
+/web/coverage/
 
-# 登录态资产
-/data/storage_states/*.json
+# 备份、归档与临时文件
+/backups/
+*.bak
+*.backup
+*.dump
+*.sql.gz
+*.tar.gz
+*.tmp
+*.swp
+*~
 
-# 前端
-/web/dist
-/web/node_modules
-
-# IDE
+# 编辑器与操作系统
 .idea/
 .vscode/
-
-# 日志
-*.log
-/logs/
+.DS_Store
+Thumbs.db
+Desktop.ini

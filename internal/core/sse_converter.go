@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // openAIChunk OpenAI 流式响应单个 chunk
@@ -99,12 +100,12 @@ func ConvertStream(in <-chan StreamChunk, model, requestID string, onFinal func(
 	return out
 }
 
-
 // buildSSE 构造一个文本 delta chunk
 func buildSSE(id, model string, delta map[string]any, finish *string) string {
 	payload := openAIChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
 		Model:   model,
 		Choices: []chunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
 	}
@@ -117,9 +118,9 @@ func buildSSE(id, model string, delta map[string]any, finish *string) string {
 // 每个 tool_call 带唯一的 index。
 func buildToolCallsSSE(id, model string, calls []ParsedToolCall) string {
 	tcs := make([]map[string]any, 0, len(calls))
-	for _, c := range calls {
+	for i, c := range calls {
 		tcs = append(tcs, map[string]any{
-			"index": 0,
+			"index": i,
 			"id":    nextToolCallID(),
 			"type":  "function",
 			"function": map[string]any{
@@ -131,6 +132,7 @@ func buildToolCallsSSE(id, model string, calls []ParsedToolCall) string {
 	payload := openAIChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
 		Model:   model,
 		Choices: []chunkChoice{{
 			Index:        0,
@@ -155,6 +157,7 @@ func BuildCompletion(id, model, reasoning, content string, tools []Tool) map[str
 		return map[string]any{
 			"id":      id,
 			"object":  "chat.completion",
+			"created": time.Now().Unix(),
 			"model":   model,
 			"choices": []map[string]any{{
 				"index":         0,
@@ -174,6 +177,7 @@ func BuildCompletion(id, model, reasoning, content string, tools []Tool) map[str
 		return map[string]any{
 			"id":      id,
 			"object":  "chat.completion",
+			"created": time.Now().Unix(),
 			"model":   model,
 			"choices": []map[string]any{{
 				"index":         0,
@@ -207,6 +211,7 @@ func BuildCompletion(id, model, reasoning, content string, tools []Tool) map[str
 	return map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
+		"created": time.Now().Unix(),
 		"model":   model,
 		"choices": []map[string]any{{
 			"index":         0,

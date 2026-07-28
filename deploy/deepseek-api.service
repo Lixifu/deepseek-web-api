@@ -1,21 +1,29 @@
 [Unit]
 Description=DeepSeek Web API (Go)
-After=network.target mysql.service redis.service
+Wants=network-online.target mariadb.service redis.service
+After=network-online.target mariadb.service redis.service
 
 [Service]
 Type=simple
-User=deepseek
-Group=deepseek
-WorkingDirectory=/opt/deepseek-api
-EnvironmentFile=/opt/deepseek-api/.env
-ExecStart=/opt/deepseek-api/deepseek-api
-Restart=on-failure
+User=admin
+Group=admin
+WorkingDirectory=/home/admin/myworkplace/deepseekapi/deepseek-web-api
+EnvironmentFile=/home/admin/myworkplace/deepseekapi/deepseek-web-api/.env
+Environment=HOME=/home/admin
+ExecStart=/home/admin/myworkplace/deepseekapi/deepseek-web-api/deepseek-api
+Restart=always
 RestartSec=5
 LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
 
-# 优雅退出：等待进行中的流式请求完成
 KillSignal=SIGTERM
 TimeoutStopSec=30
+TimeoutStartSec=120
 
 [Install]
 WantedBy=multi-user.target

@@ -2,11 +2,12 @@ package repository
 
 import (
 	"context"
+	"sort"
 	"time"
 
+	"deepseek-web-api/internal/model"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-	"deepseek-web-api/internal/model"
 )
 
 type Repository struct {
@@ -134,7 +135,7 @@ func (r *Repository) IncrementUsage(ctx context.Context, apiKeyID uint, success 
 
 // TodayUsage 返回某 API key 今日（本地时区）的 (success, failed) 调用次数。
 func (r *Repository) TodayUsage(ctx context.Context, apiKeyID uint) (success, failed int64, err error) {
-	start := time.Now().Truncate(24 * time.Hour)
+	start := startOfLocalDay(time.Now())
 	var res struct {
 		S int64
 		F int64
@@ -172,10 +173,10 @@ func (r *Repository) APIKeyUsageRange(ctx context.Context, apiKeyID uint, from, 
 // APIKeyUsageSummary 单个 API key 的用量汇总，附加在列表里给前端展示
 type APIKeyUsageSummary struct {
 	model.APIKey
-	TodayUsed   int64 `json:"today_used"`    // 今日已用（success+failed）
-	SuccessCnt  int64 `json:"success_cnt"`   // 今日成功
-	FailedCnt   int64 `json:"failed_cnt"`    // 今日失败
-	Remaining   int64 `json:"remaining"`     // 今日剩余（-1 表示不限）
+	TodayUsed  int64 `json:"today_used"`  // 今日已用（success+failed）
+	SuccessCnt int64 `json:"success_cnt"` // 今日成功
+	FailedCnt  int64 `json:"failed_cnt"`  // 今日失败
+	Remaining  int64 `json:"remaining"`   // 今日剩余（-1 表示不限）
 }
 
 // ListAPIKeysWithUsage 列出所有 API key，并附带今日用量。
@@ -185,7 +186,7 @@ func (r *Repository) ListAPIKeysWithUsage(ctx context.Context) ([]APIKeyUsageSum
 	if err := r.DB.WithContext(ctx).Order("id").Find(&keys).Error; err != nil {
 		return nil, err
 	}
-	start := time.Now().Truncate(24 * time.Hour)
+	start := startOfLocalDay(time.Now())
 	// 一次性聚合所有 key 的今日用量
 	type aggRow struct {
 		APIKeyID uint
@@ -224,6 +225,13 @@ func (r *Repository) ListAPIKeysWithUsage(ctx context.Context) ([]APIKeyUsageSum
 		})
 	}
 	return out, nil
+}
+
+// startOfLocalDay 返回传入时间所在时区的本地零点。
+// time.Truncate(24h) 按绝对时长截断，在 UTC+8 会得到当天 08:00。
+func startOfLocalDay(t time.Time) time.Time {
+	year, month, day := t.Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, t.Location())
 }
 
 // ---------- Conversation ----------
@@ -297,16 +305,287 @@ func (r *Repository) GetAdminByUsername(ctx context.Context, username string) (*
 	return &a, err
 }
 
+func (r *Repository) GetAdmin(ctx context.Context, id uint) (*model.Admin, error) {
+	var admin model.Admin
+	err := r.DB.WithContext(ctx).First(&admin, id).Error
+	return &admin, err
+}
+
+func (r *Repository) ListAdmins(ctx context.Context) ([]model.Admin, error) {
+	var admins []model.Admin
+	err := r.DB.WithContext(ctx).Order("id ASC").Find(&admins).Error
+	return admins, err
+}
+
 func (r *Repository) CreateAdmin(ctx context.Context, a *model.Admin) error {
 	return r.DB.WithContext(ctx).Create(a).Error
+}
+
+func (r *Repository) UpdateAdmin(ctx context.Context, admin *model.Admin) error {
+	return r.DB.WithContext(ctx).Save(admin).Error
+}
+
+func (r *Repository) TouchAdminLogin(ctx context.Context, id uint) error {
+	now := time.Now()
+	return r.DB.WithContext(ctx).Model(&model.Admin{}).
+		Where("id = ?", id).Update("last_login_at", now).Error
+}
+
+func (r *Repository) CountEnabledSuperadmins(ctx context.Context) (int64, error) {
+	var count int64
+	err := r.DB.WithContext(ctx).Model(&model.Admin{}).
+		Where("role = ? AND enabled = ?", "superadmin", true).
+		Count(&count).Error
+	return count, err
+}
+
+// ---------- Audit log ----------
+
+func (r *Repository) CreateAuditLog(ctx context.Context, entry *model.AuditLog) error {
+	return r.DB.WithContext(ctx).Create(entry).Error
+}
+
+type AuditQuery struct {
+	AdminID  uint
+	Action   string
+	Resource string
+	From     time.Time
+	To       time.Time
+	Page     int
+	Size     int
+}
+
+type AuditRecord struct {
+	ID         uint       `json:"id"`
+	AdminID    uint       `json:"admin_id"`
+	AdminName  string     `json:"admin_name"`
+	Action     string     `json:"action"`
+	Resource   string     `json:"resource"`
+	ResourceID string     `json:"resource_id"`
+	Method     string     `json:"method"`
+	Path       string     `json:"path"`
+	ClientIP   string     `json:"client_ip"`
+	Status     int        `json:"status"`
+	CreatedAt  time.Time  `json:"created_at"`
+	Archived   bool       `json:"archived"`
+	ArchivedAt *time.Time `json:"archived_at,omitempty"`
+}
+
+func applyAuditFilters(tx *gorm.DB, query AuditQuery) *gorm.DB {
+	if query.AdminID != 0 {
+		tx = tx.Where("admin_id = ?", query.AdminID)
+	}
+	if query.Action != "" {
+		tx = tx.Where("action = ?", query.Action)
+	}
+	if query.Resource != "" {
+		tx = tx.Where("resource = ?", query.Resource)
+	}
+	if !query.From.IsZero() {
+		tx = tx.Where("created_at >= ?", query.From)
+	}
+	if !query.To.IsZero() {
+		tx = tx.Where("created_at < ?", query.To)
+	}
+	return tx
+}
+
+// QueryAuditRecords reads hot records, archived records, or a merged view.
+func (r *Repository) QueryAuditRecords(
+	ctx context.Context,
+	query AuditQuery,
+	scope string,
+	offset, limit int,
+) ([]AuditRecord, int64, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit < 1 {
+		limit = 50
+	}
+	switch scope {
+	case "active":
+		return r.queryActiveAuditRecords(ctx, query, offset, limit)
+	case "archive":
+		return r.queryArchivedAuditRecords(ctx, query, offset, limit)
+	case "all", "":
+	default:
+		return nil, 0, gorm.ErrInvalidData
+	}
+
+	fetchLimit := offset + limit
+	active, activeTotal, err := r.queryActiveAuditRecords(ctx, query, 0, fetchLimit)
+	if err != nil {
+		return nil, 0, err
+	}
+	archived, archivedTotal, err := r.queryArchivedAuditRecords(ctx, query, 0, fetchLimit)
+	if err != nil {
+		return nil, 0, err
+	}
+	records := append(active, archived...)
+	sort.SliceStable(records, func(i, j int) bool {
+		if records[i].CreatedAt.Equal(records[j].CreatedAt) {
+			return records[i].ID > records[j].ID
+		}
+		return records[i].CreatedAt.After(records[j].CreatedAt)
+	})
+	if offset >= len(records) {
+		return []AuditRecord{}, activeTotal + archivedTotal, nil
+	}
+	end := offset + limit
+	if end > len(records) {
+		end = len(records)
+	}
+	return records[offset:end], activeTotal + archivedTotal, nil
+}
+
+func (r *Repository) queryActiveAuditRecords(
+	ctx context.Context,
+	query AuditQuery,
+	offset, limit int,
+) ([]AuditRecord, int64, error) {
+	tx := applyAuditFilters(r.DB.WithContext(ctx).Model(&model.AuditLog{}), query)
+	var total int64
+	if err := tx.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var entries []model.AuditLog
+	if err := tx.Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&entries).Error; err != nil {
+		return nil, 0, err
+	}
+	records := make([]AuditRecord, 0, len(entries))
+	for _, entry := range entries {
+		records = append(records, auditRecordFromActive(entry))
+	}
+	return records, total, nil
+}
+
+func (r *Repository) queryArchivedAuditRecords(
+	ctx context.Context,
+	query AuditQuery,
+	offset, limit int,
+) ([]AuditRecord, int64, error) {
+	tx := applyAuditFilters(r.DB.WithContext(ctx).Model(&model.AuditLogArchive{}), query)
+	var total int64
+	if err := tx.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var entries []model.AuditLogArchive
+	if err := tx.Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&entries).Error; err != nil {
+		return nil, 0, err
+	}
+	records := make([]AuditRecord, 0, len(entries))
+	for _, entry := range entries {
+		archivedAt := entry.ArchivedAt
+		records = append(records, AuditRecord{
+			ID:         entry.ID,
+			AdminID:    entry.AdminID,
+			AdminName:  entry.AdminName,
+			Action:     entry.Action,
+			Resource:   entry.Resource,
+			ResourceID: entry.ResourceID,
+			Method:     entry.Method,
+			Path:       entry.Path,
+			ClientIP:   entry.ClientIP,
+			Status:     entry.Status,
+			CreatedAt:  entry.CreatedAt,
+			Archived:   true,
+			ArchivedAt: &archivedAt,
+		})
+	}
+	return records, total, nil
+}
+
+func auditRecordFromActive(entry model.AuditLog) AuditRecord {
+	return AuditRecord{
+		ID:         entry.ID,
+		AdminID:    entry.AdminID,
+		AdminName:  entry.AdminName,
+		Action:     entry.Action,
+		Resource:   entry.Resource,
+		ResourceID: entry.ResourceID,
+		Method:     entry.Method,
+		Path:       entry.Path,
+		ClientIP:   entry.ClientIP,
+		Status:     entry.Status,
+		CreatedAt:  entry.CreatedAt,
+	}
+}
+
+// ArchiveAuditLogs moves one idempotent batch into the archive table.
+func (r *Repository) ArchiveAuditLogs(ctx context.Context, before time.Time, batchSize int) (int, error) {
+	if batchSize < 1 {
+		batchSize = 1000
+	}
+	archived := 0
+	err := r.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var entries []model.AuditLog
+		if err := tx.Where("created_at < ?", before).
+			Order("id ASC").
+			Limit(batchSize).
+			Find(&entries).Error; err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			return nil
+		}
+		now := time.Now()
+		archives := make([]model.AuditLogArchive, 0, len(entries))
+		ids := make([]uint, 0, len(entries))
+		for _, entry := range entries {
+			archives = append(archives, model.AuditLogArchive{
+				ID:         entry.ID,
+				AdminID:    entry.AdminID,
+				AdminName:  entry.AdminName,
+				Action:     entry.Action,
+				Resource:   entry.Resource,
+				ResourceID: entry.ResourceID,
+				Method:     entry.Method,
+				Path:       entry.Path,
+				ClientIP:   entry.ClientIP,
+				Status:     entry.Status,
+				CreatedAt:  entry.CreatedAt,
+				ArchivedAt: now,
+			})
+			ids = append(ids, entry.ID)
+		}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&archives).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id IN ?", ids).Delete(&model.AuditLog{}).Error; err != nil {
+			return err
+		}
+		archived = len(entries)
+		return nil
+	})
+	return archived, err
+}
+
+func (r *Repository) DeleteArchivedAuditLogs(ctx context.Context, before time.Time, batchSize int) (int64, error) {
+	if batchSize < 1 {
+		batchSize = 1000
+	}
+	var ids []uint
+	if err := r.DB.WithContext(ctx).Model(&model.AuditLogArchive{}).
+		Where("created_at < ?", before).
+		Order("id ASC").
+		Limit(batchSize).
+		Pluck("id", &ids).Error; err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	result := r.DB.WithContext(ctx).Where("id IN ?", ids).Delete(&model.AuditLogArchive{})
+	return result.RowsAffected, result.Error
 }
 
 // ---------- Dashboard ----------
 
 type DashboardStat struct {
-	TotalCalls   int64 `json:"total_calls"`
-	SuccessCalls int64 `json:"success_calls"`
-	FailedCalls  int64 `json:"failed_calls"`
+	TotalCalls     int64 `json:"total_calls"`
+	SuccessCalls   int64 `json:"success_calls"`
+	FailedCalls    int64 `json:"failed_calls"`
 	ActiveAccounts int64 `json:"active_accounts"`
 	TotalAccounts  int64 `json:"total_accounts"`
 }

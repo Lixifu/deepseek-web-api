@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
+	"deepseek-web-api/internal/model"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
-	"deepseek-web-api/internal/model"
 )
 
 // Repository 数据访问接口（由 repository 包实现，避免循环依赖）
@@ -74,14 +74,22 @@ func (o *Orchestrator) Chat(ctx context.Context, req ChatRequest) (map[string]an
 	restartTried := false
 
 	for attempt := 0; attempt < 3; attempt++ {
+		poolGeneration := o.Pool.Generation()
 		sess, err := o.Pool.Acquire(ctx, tried)
 		if err != nil {
+			if errors.Is(err, ErrPoolBusy) ||
+				errors.Is(err, ErrQueueFull) ||
+				errors.Is(err, ErrQueueTimeout) ||
+				errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded) {
+				return nil, nil, err
+			}
 			// 池里没有可用会话，可能是浏览器崩溃后所有会话被标记为 unhealthy，
 			// 尝试重启一次浏览器池
 			if errors.Is(err, ErrNoSession) && !restartTried {
 				restartTried = true
 				o.Logger.Warn("no session available, attempting browser pool restart")
-				if rerr := o.Pool.Restart(); rerr != nil {
+				if _, rerr := o.Pool.RestartIfGeneration(poolGeneration); rerr != nil {
 					o.Logger.Error("pool restart failed", zap.Error(rerr))
 					return nil, nil, fmt.Errorf("%w: %v", ErrAllSessionsDown, rerr)
 				}
@@ -92,6 +100,7 @@ func (o *Orchestrator) Chat(ctx context.Context, req ChatRequest) (map[string]an
 			}
 			break
 		}
+		poolGeneration = sess.generation
 		tried[sess.AccountID] = true
 
 		driver := NewDeepSeekDriver(sess, o.Selector, o.Logger)
@@ -115,7 +124,7 @@ func (o *Orchestrator) Chat(ctx context.Context, req ChatRequest) (map[string]an
 					zap.Uint("account_id", sess.AccountID), zap.Error(err))
 				if !restartTried {
 					restartTried = true
-					if rerr := o.Pool.Restart(); rerr != nil {
+					if _, rerr := o.Pool.RestartIfGeneration(poolGeneration); rerr != nil {
 						o.Logger.Error("pool restart failed", zap.Error(rerr))
 						return nil, nil, fmt.Errorf("%w: %v", ErrAllSessionsDown, rerr)
 					}
