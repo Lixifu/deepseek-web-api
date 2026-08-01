@@ -126,9 +126,18 @@ func (d *DeepSeekDriver) SendMessage(ctx context.Context, text string) (<-chan S
 		zap.Bool("search", d.mc.Search),
 		zap.Int("prompt_len", len(text)))
 
-	// 记录发送前的助手消息数量，便于定位"本次回复"
-	beforeCount, _ := page.Locator(d.sel.AssistantMsg).Count()
-	d.logger.Info("send_message: before assistant count", zap.Int("beforeCount", beforeCount))
+	// 给发送前已有的回复节点做快照。不能依赖节点数量判断新回复：
+	// DeepSeek 会复用/虚拟化历史消息 DOM，新增一轮后节点总数可能保持不变。
+	snapshot, err := captureReplySnapshot(page, d.sel.AssistantMsg)
+	if err != nil {
+		d.logger.Error("send_message: capture reply snapshot failed", zap.Error(err))
+		return nil, fmt.Errorf("capture reply snapshot: %w", err)
+	}
+	d.logger.Info("send_message: reply snapshot captured",
+		zap.Int("main_count", snapshot.MainCount),
+		zap.Int("reasoning_count", snapshot.ReasoningCount),
+		zap.Int("content_len", len(snapshot.Content)),
+		zap.Int("reasoning_len", len(snapshot.Reasoning)))
 
 	// 输入文本（兼容 textarea 与 contenteditable）
 	if err := fillInput(page, d.sel.ChatInput, text); err != nil {
@@ -161,89 +170,254 @@ func (d *DeepSeekDriver) SendMessage(ctx context.Context, text string) (<-chan S
 	}
 
 	ch := make(chan StreamChunk, 32)
-	go d.streamReply(ctx, page, beforeCount, ch)
+	go d.streamReply(ctx, page, snapshot, ch)
 	return ch, nil
 }
 
-// jsGetReasoningAndContent 用 JavaScript 同时获取思维链和正文文本。
-// DeepSeek 深度思考模式下，思维链在含 "think" class 的容器内，正文不在。
-// 返回 {reasoning: "...", content: "..."}。
-var jsGetText = `() => {
-  const sel = '.ds-markdown--block, .ds-markdown, .markdown-body';
-  const blocks = document.querySelectorAll(sel);
-  let reasoning = '', content = '';
-  for (const block of blocks) {
-    const text = block.innerText || '';
-    if (!text) continue;
-    // 检查是否在 think/reason 容器内
-    const thinkParent = block.closest('[class*="think"], [class*="Think"], [class*="reason"], [class*="Reason"]');
-    if (thinkParent) {
-      reasoning += text;
-    } else {
-      content += text;
-    }
-  }
-  return {reasoning, content};
-}`
+const replySnapshotAttribute = "data-deepseek-api-snapshot"
 
-// streamReply 轮询最新助手消息，推送思维链和正文增量。
-// 用「停止」按钮消失判断生成完成（比文本稳定更可靠，不会在思维链→正文停顿时提前结束）。
-// 全程用 JS evaluate 获取文本，避免 Locator.Count() 在某些页面状态下挂起。
-func (d *DeepSeekDriver) streamReply(ctx context.Context, page playwright.Page, beforeCount int, ch chan<- StreamChunk) {
+type jsEvaluator interface {
+	Evaluate(expression string, arg ...interface{}) (interface{}, error)
+}
+
+type replySnapshot struct {
+	Marker         string
+	Reasoning      string
+	Content        string
+	MainCount      int
+	ReasoningCount int
+}
+
+type replyPollResult struct {
+	Reasoning      string
+	Content        string
+	TurnDetected   bool
+	Generating     bool
+	MainCount      int
+	ReasoningCount int
+}
+
+type replyStreamConfig struct {
+	PollInterval          time.Duration
+	StableAfterStop       time.Duration
+	StableWithoutControl  time.Duration
+	ReasoningOnlyStable   time.Duration
+	StaleControlStable    time.Duration
+	StaleReasoningControl time.Duration
+	MaxWait               time.Duration
+}
+
+var defaultReplyStreamConfig = replyStreamConfig{
+	PollInterval:          300 * time.Millisecond,
+	StableAfterStop:       1200 * time.Millisecond,
+	StableWithoutControl:  4 * time.Second,
+	ReasoningOnlyStable:   10 * time.Second,
+	StaleControlStable:    12 * time.Second,
+	StaleReasoningControl: 20 * time.Second,
+	MaxWait:               3 * time.Minute,
+}
+
+// captureReplySnapshot 标记发送前已有的回复节点并保存最后一条文本。
+// 新一轮回复即使复用了 DOM 节点，也能通过文本相对快照的变化识别。
+func captureReplySnapshot(page jsEvaluator, assistantSelector string) (replySnapshot, error) {
+	marker := fmt.Sprintf("turn-%d", time.Now().UnixNano())
+	script := buildReplySnapshotScript(assistantSelector, marker)
+	result, err := page.Evaluate(script)
+	if err != nil {
+		return replySnapshot{}, err
+	}
+	m, ok := result.(map[string]interface{})
+	if !ok {
+		return replySnapshot{}, fmt.Errorf("unexpected snapshot result type %T", result)
+	}
+	return replySnapshot{
+		Marker:         marker,
+		Reasoning:      stringValue(m["reasoning"]),
+		Content:        stringValue(m["content"]),
+		MainCount:      intValue(m["mainCount"]),
+		ReasoningCount: intValue(m["reasoningCount"]),
+	}, nil
+}
+
+func buildReplySnapshotScript(assistantSelector, marker string) string {
+	return fmt.Sprintf(`() => {
+	  const assistantSelector = %q;
+	  const marker = %q;
+	  const textOf = (node) => node ? (node.innerText || node.textContent || '') : '';
+	  const isReasoning = (node) => !!(node && node.closest(
+	    '[class*="think"], [class*="Think"], [class*="reason"], [class*="Reason"]'
+	  ));
+	  const legacyNodes = Array.from(document.querySelectorAll(assistantSelector));
+	  const preferredMain = Array.from(document.querySelectorAll('.ds-assistant-message-main-content'));
+	  const mainNodes = preferredMain.length
+	    ? preferredMain
+	    : legacyNodes.filter((node) => !isReasoning(node));
+	  const reasoningNodes = legacyNodes.filter(isReasoning);
+	  const nodesToMark = new Set([...legacyNodes, ...preferredMain]);
+	  for (const node of nodesToMark) {
+	    node.setAttribute(%q, marker);
+	  }
+	  const currentMain = mainNodes.length ? mainNodes[mainNodes.length - 1] : null;
+	  const currentReasoning = reasoningNodes.length
+	    ? reasoningNodes[reasoningNodes.length - 1]
+	    : null;
+	  return {
+	    content: textOf(currentMain),
+	    reasoning: textOf(currentReasoning),
+	    mainCount: mainNodes.length,
+	    reasoningCount: reasoningNodes.length
+	  };
+	}`, assistantSelector, marker, replySnapshotAttribute)
+}
+
+func buildReplyPollScript(assistantSelector string, snapshot replySnapshot) string {
+	return fmt.Sprintf(`() => {
+	  const assistantSelector = %q;
+	  const marker = %q;
+	  const baselineContent = %q;
+	  const baselineReasoning = %q;
+	  const textOf = (node) => node ? (node.innerText || node.textContent || '') : '';
+	  const isReasoning = (node) => !!(node && node.closest(
+	    '[class*="think"], [class*="Think"], [class*="reason"], [class*="Reason"]'
+	  ));
+	  const isVisible = (node) => {
+	    if (!node || node.getAttribute('aria-hidden') === 'true') return false;
+	    const style = window.getComputedStyle(node);
+	    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+	      return false;
+	    }
+	    const rect = node.getBoundingClientRect();
+	    return rect.width > 0 && rect.height > 0;
+	  };
+	  const isNew = (node, text, baseline) => !!node && (
+	    node.getAttribute(%q) !== marker || text !== baseline
+	  );
+
+	  const legacyNodes = Array.from(document.querySelectorAll(assistantSelector));
+	  const preferredMain = Array.from(document.querySelectorAll('.ds-assistant-message-main-content'));
+	  const mainNodes = preferredMain.length
+	    ? preferredMain
+	    : legacyNodes.filter((node) => !isReasoning(node));
+	  const reasoningNodes = legacyNodes.filter(isReasoning);
+	  const currentMain = mainNodes.length ? mainNodes[mainNodes.length - 1] : null;
+	  const currentReasoning = reasoningNodes.length
+	    ? reasoningNodes[reasoningNodes.length - 1]
+	    : null;
+	  const currentContent = textOf(currentMain);
+	  const currentReasoningText = textOf(currentReasoning);
+	  const contentIsNew = isNew(currentMain, currentContent, baselineContent);
+	  const reasoningIsNew = isNew(currentReasoning, currentReasoningText, baselineReasoning);
+	  const turnDetected = contentIsNew || reasoningIsNew;
+
+	  let generating = false;
+	  const controls = document.querySelectorAll('button, [role="button"]');
+	  for (const control of controls) {
+	    if (!isVisible(control)) continue;
+	    const label = [
+	      control.innerText,
+	      control.textContent,
+	      control.getAttribute('aria-label'),
+	      control.getAttribute('title')
+	    ].filter(Boolean).join(' ').replace(/\s+/g, '').toLowerCase();
+	    if (label.includes('停止') || label.includes('中止') ||
+	        label.includes('stop') || label.includes('cancelgeneration')) {
+	      generating = true;
+	      break;
+	    }
+	  }
+
+	  return {
+	    reasoning: turnDetected && reasoningIsNew ? currentReasoningText : '',
+	    content: turnDetected && contentIsNew ? currentContent : '',
+	    turnDetected,
+	    generating,
+	    mainCount: mainNodes.length,
+	    reasoningCount: reasoningNodes.length
+	  };
+	}`, assistantSelector, snapshot.Marker, snapshot.Content, snapshot.Reasoning, replySnapshotAttribute)
+}
+
+func decodeReplyPoll(result interface{}) (replyPollResult, error) {
+	m, ok := result.(map[string]interface{})
+	if !ok {
+		return replyPollResult{}, fmt.Errorf("unexpected poll result type %T", result)
+	}
+	return replyPollResult{
+		Reasoning:      stringValue(m["reasoning"]),
+		Content:        stringValue(m["content"]),
+		TurnDetected:   boolValue(m["turnDetected"]),
+		Generating:     boolValue(m["generating"]),
+		MainCount:      intValue(m["mainCount"]),
+		ReasoningCount: intValue(m["reasoningCount"]),
+	}, nil
+}
+
+func stringValue(v interface{}) string {
+	s, _ := v.(string)
+	return s
+}
+
+func boolValue(v interface{}) bool {
+	b, _ := v.(bool)
+	return b
+}
+
+func intValue(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case float64:
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+// streamReply 轮询本轮助手回复，推送思维链和正文增量。
+// 完成判断优先使用可见的生成控制按钮，并以文本稳定窗口兜底。
+func (d *DeepSeekDriver) streamReply(ctx context.Context, page jsEvaluator, snapshot replySnapshot, ch chan<- StreamChunk) {
+	d.streamReplyWithConfig(ctx, page, snapshot, ch, defaultReplyStreamConfig)
+}
+
+func (d *DeepSeekDriver) streamReplyWithConfig(
+	ctx context.Context,
+	page jsEvaluator,
+	snapshot replySnapshot,
+	ch chan<- StreamChunk,
+	cfg replyStreamConfig,
+) {
 	defer close(ch)
-	d.logger.Info("stream_reply: started", zap.Int("beforeCount", beforeCount))
+	d.logger.Info("stream_reply: started",
+		zap.Int("main_count", snapshot.MainCount),
+		zap.Int("reasoning_count", snapshot.ReasoningCount))
 
 	var lastReasoning, lastContent string
-	ticker := time.NewTicker(300 * time.Millisecond)
+	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
 
-	// 用 JS 同时检测：停止按钮是否存在 + 本次新增的最后一条助手消息。
-	// 不能扫描页面上所有 markdown，否则第二轮开始会把历史回复重复返回。
-	// 停止按钮存在 = 正在生成；消失 = 生成完成
-	jsPoll := fmt.Sprintf(`() => {
-	  const assistantSelector = %q;
-	  const assistantNodes = document.querySelectorAll(assistantSelector);
-	  const current = assistantNodes.length > %d
-	    ? assistantNodes[assistantNodes.length - 1]
-	    : null;
-	  const blocks = !current
-	    ? []
-	    : (current.matches('.ds-markdown--block, .ds-markdown, .markdown-body')
-	        ? [current]
-	        : current.querySelectorAll('.ds-markdown--block, .ds-markdown, .markdown-body'));
-	  let reasoning = '', content = '';
-	  for (const block of blocks) {
-	    const text = block.innerText || '';
-	    if (!text) continue;
-	    const thinkParent = block.closest('[class*="think"], [class*="Think"], [class*="reason"], [class*="Reason"]');
-	    if (thinkParent) { reasoning += text; } else { content += text; }
-	  }
-	  // 检测停止按钮（正在生成时会出现）
-	  let stopBtn = false;
-	  const btns = document.querySelectorAll('div[role="button"]');
-	  for (const b of btns) {
-	    const t = (b.innerText || '').trim();
-	    if (t === '停止') { stopBtn = true; break; }
-	  }
-	  return {reasoning, content, stopBtn};
-	}`, d.sel.AssistantMsg, beforeCount)
+	jsPoll := buildReplyPollScript(d.sel.AssistantMsg, snapshot)
 
 	startTime := time.Now()
-	maxWait := 600 // 最多 180s（600 ticks * 300ms）
+	deadline := startTime.Add(cfg.MaxWait)
 	tick := 0
 	lastLogTick := 0
 	started := false
+	generationObserved := false
+	lastChangedAt := time.Time{}
+	var lastPoll replyPollResult
 
-	for tick < maxWait {
+	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			d.logger.Info("stream_reply: ctx done", zap.Int("tick", tick))
+			d.logger.Info("stream_reply: ctx done",
+				zap.Int("tick", tick),
+				zap.Bool("started", started),
+				zap.Error(ctx.Err()))
 			return
 		case <-ticker.C:
 		}
 		tick++
 
-		// 用 JS 获取思维链、正文和停止按钮状态
 		result, err := page.Evaluate(jsPoll)
 		if err != nil {
 			if tick%10 == 0 {
@@ -253,26 +427,29 @@ func (d *DeepSeekDriver) streamReply(ctx context.Context, page playwright.Page, 
 			continue
 		}
 
-		m, ok := result.(map[string]interface{})
-		if !ok {
+		poll, err := decodeReplyPoll(result)
+		if err != nil {
 			if tick%10 == 0 {
 				d.logger.Warn("stream: evaluate result not map",
-					zap.Int("tick", tick), zap.Any("type", fmt.Sprintf("%T", result)))
+					zap.Int("tick", tick), zap.Error(err))
 			}
 			continue
 		}
-		curReasoning, _ := m["reasoning"].(string)
-		curContent, _ := m["content"].(string)
-		stopBtn, _ := m["stopBtn"].(bool)
+		lastPoll = poll
+		if poll.Generating {
+			generationObserved = true
+		}
 
-		// 标记生成已开始（有任何文本）
-		if !started && (curReasoning != "" || curContent != "") {
+		// 必须确认文本属于本轮，避免把历史回复当作新回复返回。
+		if !started && poll.TurnDetected && (poll.Reasoning != "" || poll.Content != "") {
 			started = true
+			lastChangedAt = time.Now()
 			d.logger.Info("stream: generation started",
 				zap.Int("tick", tick),
 				zap.Duration("waited", time.Since(startTime)),
-				zap.Int("reasoning_len", len(curReasoning)),
-				zap.Int("content_len", len(curContent)))
+				zap.Bool("generating", poll.Generating),
+				zap.Int("reasoning_len", len(poll.Reasoning)),
+				zap.Int("content_len", len(poll.Content)))
 		}
 
 		// 每 5s 记录一次状态
@@ -280,97 +457,114 @@ func (d *DeepSeekDriver) streamReply(ctx context.Context, page playwright.Page, 
 			d.logger.Info("stream: polling status",
 				zap.Int("tick", tick),
 				zap.Bool("started", started),
-				zap.Bool("stopBtn", stopBtn),
-				zap.Int("reasoning_len", len(curReasoning)),
-				zap.Int("content_len", len(curContent)))
+				zap.Bool("turn_detected", poll.TurnDetected),
+				zap.Bool("generating", poll.Generating),
+				zap.Bool("generation_observed", generationObserved),
+				zap.Int("main_count", poll.MainCount),
+				zap.Int("reasoning_count", poll.ReasoningCount),
+				zap.Int("reasoning_len", len(poll.Reasoning)),
+				zap.Int("content_len", len(poll.Content)))
 			lastLogTick = tick
 		}
 
-		// 推送思维链增量
-		if curReasoning != lastReasoning {
-			if len(curReasoning) > len(lastReasoning) && strings.HasPrefix(curReasoning, lastReasoning) {
+		// DOM 重排时本轮节点可能短暂消失。空值不用于回退已捕获文本，
+		// 否则节点恢复后会把完整回复再次当增量发送。
+		if poll.TurnDetected && poll.Reasoning != "" && poll.Reasoning != lastReasoning {
+			if len(poll.Reasoning) > len(lastReasoning) && strings.HasPrefix(poll.Reasoning, lastReasoning) {
 				select {
-				case ch <- StreamChunk{Reasoning: curReasoning[len(lastReasoning):]}:
+				case ch <- StreamChunk{Reasoning: poll.Reasoning[len(lastReasoning):]}:
 				case <-ctx.Done():
 					return
 				}
 			} else {
 				select {
-				case ch <- StreamChunk{Reasoning: curReasoning}:
+				case ch <- StreamChunk{Reasoning: poll.Reasoning}:
 				case <-ctx.Done():
 					return
 				}
 			}
-			lastReasoning = curReasoning
+			lastReasoning = poll.Reasoning
+			lastChangedAt = time.Now()
 		}
 
 		// 推送正文增量
-		if curContent != lastContent {
-			if len(curContent) > len(lastContent) && strings.HasPrefix(curContent, lastContent) {
+		if poll.TurnDetected && poll.Content != "" && poll.Content != lastContent {
+			if len(poll.Content) > len(lastContent) && strings.HasPrefix(poll.Content, lastContent) {
 				select {
-				case ch <- StreamChunk{Content: curContent[len(lastContent):]}:
+				case ch <- StreamChunk{Content: poll.Content[len(lastContent):]}:
 				case <-ctx.Done():
 					return
 				}
 			} else {
 				select {
-				case ch <- StreamChunk{Content: curContent}:
+				case ch <- StreamChunk{Content: poll.Content}:
 				case <-ctx.Done():
 					return
 				}
 			}
-			lastContent = curContent
+			lastContent = poll.Content
+			lastChangedAt = time.Now()
 		}
 
-		// 检查生成是否完成：停止按钮消失 + 已开始生成
-		if started && !stopBtn {
-			d.logger.Info("stream: stop button disappeared, finalizing",
-				zap.Int("tick", tick),
-				zap.Int("reasoning_len", len(lastReasoning)),
-				zap.Int("content_len", len(lastContent)))
-			// 停止按钮消失，再等 1s 确保最终文本稳定
-			select {
-			case <-ctx.Done():
+		if started {
+			stableFor := time.Since(lastChangedAt)
+			if complete, reason := shouldFinalizeReply(
+				poll, generationObserved, lastContent != "", stableFor, cfg,
+			); complete {
+				d.logger.Info("stream: reply stable, finalizing",
+					zap.String("reason", reason),
+					zap.Int("tick", tick),
+					zap.Duration("stable_for", stableFor),
+					zap.Int("reasoning_len", len(lastReasoning)),
+					zap.Int("content_len", len(lastContent)))
+				d.logger.Info("stream_reply: completed",
+					zap.Int("final_reasoning_len", len(lastReasoning)),
+					zap.Int("final_content_len", len(lastContent)))
 				return
-			case <-time.After(1 * time.Second):
 			}
-			// 最后再读一次，确保拿到最终文本
-			result2, err := page.Evaluate(jsPoll)
-			if err == nil {
-				if m2, ok := result2.(map[string]interface{}); ok {
-					finalReasoning, _ := m2["reasoning"].(string)
-					finalContent, _ := m2["content"].(string)
-					if len(finalReasoning) > len(lastReasoning) {
-						select {
-						case ch <- StreamChunk{Reasoning: finalReasoning[len(lastReasoning):]}:
-						case <-ctx.Done():
-							return
-						}
-						lastReasoning = finalReasoning
-					}
-					if len(finalContent) > len(lastContent) {
-						select {
-						case ch <- StreamChunk{Content: finalContent[len(lastContent):]}:
-						case <-ctx.Done():
-							return
-						}
-						lastContent = finalContent
-					}
-				}
-			}
-			d.logger.Info("stream_reply: completed",
-				zap.Int("final_reasoning_len", len(lastReasoning)),
-				zap.Int("final_content_len", len(lastContent)))
-			return
 		}
 	}
 
-	// 超时
 	d.logger.Warn("stream: timeout",
 		zap.Int("ticks", tick),
 		zap.Bool("started", started),
+		zap.Bool("turn_detected", lastPoll.TurnDetected),
+		zap.Bool("generating", lastPoll.Generating),
+		zap.Int("main_count", lastPoll.MainCount),
+		zap.Int("reasoning_count", lastPoll.ReasoningCount),
 		zap.Int("reasoning_len", len(lastReasoning)),
 		zap.Int("content_len", len(lastContent)))
+}
+
+func shouldFinalizeReply(
+	poll replyPollResult,
+	generationObserved bool,
+	hasContent bool,
+	stableFor time.Duration,
+	cfg replyStreamConfig,
+) (bool, string) {
+	if generationObserved && !poll.Generating && stableFor >= cfg.StableAfterStop {
+		return true, "generation control disappeared"
+	}
+	if !generationObserved && !poll.Generating {
+		required := cfg.ReasoningOnlyStable
+		if hasContent {
+			required = cfg.StableWithoutControl
+		}
+		if stableFor >= required {
+			return true, "text stable without generation control"
+		}
+	}
+	if poll.Generating {
+		required := cfg.StaleReasoningControl
+		if hasContent {
+			required = cfg.StaleControlStable
+		}
+		if stableFor >= required {
+			return true, "generation control stale"
+		}
+	}
+	return false, ""
 }
 
 // fillInput 兼容 textarea 与 contenteditable 的输入。
